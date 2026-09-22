@@ -1,3 +1,5 @@
+local task = require("async/task")
+
 local Promise = {}
 Promise.__index = Promise
 

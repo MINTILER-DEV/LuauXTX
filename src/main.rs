@@ -9,7 +9,9 @@ use std::{
 use mlua::{
     Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Thread, Value,
 };
+use sha2::{Digest, Sha256};
 use tokio::task::LocalSet;
+use uuid::Uuid;
 
 mod standard_library {
     include!(concat!(env!("OUT_DIR"), "/standard_library.rs"));
@@ -17,7 +19,7 @@ mod standard_library {
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
-const USAGE: &str = "Usage: luauxtx <script.luau> [-- <script arguments...>]\n\nRuns a trusted Luau script with async fs, http, task, and Promise APIs.";
+const USAGE: &str = "Usage: luauxtx <script.luau> [-- <script arguments...>]\n\nRuns a trusted Luau script with async system, net, and Promise APIs.";
 
 #[derive(Clone)]
 struct ModuleLoader {
@@ -120,10 +122,10 @@ fn install_host_apis(lua: &Lua, script: &Path, script_arguments: &[String]) -> L
         create_require(lua, entry_directory.to_path_buf(), loader.clone())?,
     )?;
 
-    let promise = standard_table(lua, "promise", entry_directory, loader.clone())?;
-    let task = standard_table(lua, "task", entry_directory, loader.clone())?;
-    let fs_api = standard_table(lua, "fs", entry_directory, loader.clone())?;
-    let http = standard_table(lua, "http", entry_directory, loader)?;
+    let promise = standard_table(lua, "async/promise", entry_directory, loader.clone())?;
+    let task = standard_table(lua, "async/task", entry_directory, loader.clone())?;
+    let fs_api = standard_table(lua, "system/fs", entry_directory, loader.clone())?;
+    let http = standard_table(lua, "net/http", entry_directory, loader)?;
     globals.set("Promise", promise)?;
     globals.set("task", task)?;
     globals.set("fs", fs_api)?;
@@ -245,6 +247,16 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
             });
             Ok(())
         })?,
+    )?;
+    native.set(
+        "sha256",
+        lua.create_function(|_, input: String| {
+            Ok(format!("{:x}", Sha256::digest(input.as_bytes())))
+        })?,
+    )?;
+    native.set(
+        "uuid_v4",
+        lua.create_function(|_, ()| Ok(Uuid::new_v4().to_string()))?,
     )?;
     Ok(native)
 }
@@ -493,12 +505,12 @@ mod tests {
         install_host_apis(&lua, &script, &[]).unwrap();
 
         let uses_embedded_modules: bool = lua
-            .load("return require('promise') == Promise and require('fs') == fs")
+            .load("return require('async/promise') == Promise and require('system/fs') == fs")
             .eval()
             .unwrap();
 
         assert!(uses_embedded_modules);
-        assert!(standard_library_source("http").is_some());
+        assert!(standard_library_source("net/http").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -509,7 +521,7 @@ mod tests {
         fs::write(&input, "async content").unwrap();
         let script = root.join("app.luau");
         let source = format!(
-            "assert(__xtx == nil)\nlocal value = fs.read({:?}):andThen(function(text) return text .. '!' end):await()\nlocal finished = false\ntask.delay(0.001, function() finished = true end)\ntask.wait(0.01)\nassert(finished)\nreturn value",
+            "assert(__xtx == nil)\nlocal value = fs.read({:?}):andThen(function(text) return text .. '!' end):await()\nlocal finished = false\ntask.delay(0.001, function() finished = true end)\ntask.wait(0.1)\nassert(finished)\nreturn value",
             input.to_string_lossy()
         );
         fs::write(&script, &source).unwrap();
@@ -563,5 +575,21 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(body, "hello");
+    }
+
+    #[test]
+    fn loads_new_namespaced_library_modules() {
+        let lua = Lua::new();
+        let script = PathBuf::from("namespaced-library-test.luau");
+        install_host_apis(&lua, &script, &[]).unwrap();
+
+        let valid: bool = lua
+            .load(
+                "local base64 = require('crypto/base64')\nlocal hash = require('crypto/hash')\nlocal uuid = require('crypto/uuid')\nlocal url = require('net/url')\nlocal path = require('system/path')\nlocal args = require('cli/args')\nlocal encoded = base64.encode('hello')\nassert(base64.decode(encoded) == 'hello', encoded .. ' / ' .. base64.decode(encoded))\nassert(hash.sha256('hello') == '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', 'hash')\nassert(uuid.v4():match('^[0-9a-f%-]+$'), 'uuid')\nassert(url.parse('https://example.com/a').hostname == 'example.com', 'url')\nassert(path.join('a', '..', 'b') == 'b', 'path')\nreturn args.parse({'--port=3000'}).port == '3000'",
+            )
+            .eval()
+            .unwrap();
+
+        assert!(valid);
     }
 }

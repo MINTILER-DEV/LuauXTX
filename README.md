@@ -10,19 +10,20 @@ into the executable at compile time. Rust exposes private callback-based host
 primitives to those modules only; user scripts receive the public `Promise`,
 `task`, `fs`, and `http` APIs instead.
 
-- [`lib/promise.luau`](lib/promise.luau) implements promise state and chaining.
-- [`lib/task.luau`](lib/task.luau) wraps coroutine scheduling and timers.
-- [`lib/fs.luau`](lib/fs.luau) turns filesystem completions into promises.
-- [`lib/http.luau`](lib/http.luau) shapes HTTP responses as Luau values.
+- [`lib/async/promise.luau`](lib/async/promise.luau) implements promise state and chaining.
+- [`lib/async/task.luau`](lib/async/task.luau) wraps coroutine scheduling and timers.
+- [`lib/system/fs.luau`](lib/system/fs.luau) turns filesystem completions into promises.
+- [`lib/net/http.luau`](lib/net/http.luau) shapes HTTP responses as Luau values.
 
 To add a built-in module, create a `.luau` file in `lib/` and rebuild. Module
-names follow their path, so `lib/path.luau` is loaded with `require("path")`
-and `lib/encoding/base64.luau` is loaded with `require("encoding/base64")`.
+names follow their path, so `lib/system/path.luau` is loaded with
+`require("system/path")` and `lib/crypto/base64.luau` is loaded with
+`require("crypto/base64")`.
 Directory modules can use `init.luau`, such as `lib/json/init.luau` for
 `require("json")`. The build rejects duplicate module names.
 
 ```luau
--- lib/path.luau
+-- lib/system/path.luau
 local path = {}
 
 function path.join(left, right)
@@ -33,7 +34,7 @@ return path
 ```
 
 ```luau
-local path = require("path")
+local path = require("system/path")
 print(path.join("src", "main.luau"))
 ```
 
@@ -81,8 +82,10 @@ loop. `Promise` supports `resolve`, `reject`, `all`, `andThen`, `catch`, and
 `await`. HTTP currently provides an asynchronous `http.fetch(url)` GET client.
 
 `require` caches module return values. Modules must return the value they
-export. Built-in modules are available as `require("fs")`, `require("http")`,
-`require("process")`, and `require("task")`.
+export. Built-in modules are namespaced: `require("system/fs")`,
+`require("system/path")`, `require("net/http")`, `require("net/url")`,
+`require("async/promise")`, and `require("async/task")`. `process`, `fs`,
+`http`, `task`, and `Promise` remain available as globals.
 
 The entry script may use `:await()`. Modules loaded by `require` execute
 synchronously while loading, so asynchronous work belongs in exported

@@ -1,5 +1,5 @@
 local native = ...
-local Promise = require("promise")
+local Promise = require("async/promise")
 
 local fs = {}
 
