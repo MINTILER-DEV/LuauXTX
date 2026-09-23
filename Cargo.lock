@@ -616,6 +616,7 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "luauxtx",
+ "mlua",
  "wasm-bindgen",
  "web-sys",
 ]

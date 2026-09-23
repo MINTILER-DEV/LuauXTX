@@ -4,7 +4,11 @@
   <script type="module">
     import init, { run, set_text } from "./pkg/luauxtx_web.js";
     await init();
-    document.querySelector("#output").textContent = run("return 'Luau in the browser!' ");
-    document.querySelector("#button").onclick = () => set_text("#button", "clicked");
+    document.querySelector("#output").textContent = run(`
+      local document = require("web/document")
+      local button = document:get("#button")
+      button:on("click", function() button:setText("clicked") end)
+      return "Luau browser bindings are live"
+    `);
   </script>
 </body></html>
