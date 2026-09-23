@@ -4,17 +4,24 @@ use std::{
     fs,
     net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use futures_util::{SinkExt, StreamExt};
 use mlua::{
-    Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Thread, Value,
+    AnyUserData, Error as LuaError, Function, Lua, LuaString, MultiValue, Result as LuaResult,
+    Table, Thread, UserData, Value,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::{Mutex, mpsc},
     task::LocalSet,
+};
+use tokio_tungstenite::{
+    WebSocketStream, accept_async, connect_async, tungstenite::protocol::Message,
 };
 use uuid::Uuid;
 
@@ -34,6 +41,24 @@ struct ModuleLoader {
     standard_cache: Table,
     standard_loading: Table,
 }
+
+enum WebSocketOutgoing {
+    Text(String),
+    Binary(Vec<u8>),
+    Close,
+}
+
+struct WebSocketIncoming {
+    kind: &'static str,
+    data: Vec<u8>,
+}
+
+struct WebSocketHandle {
+    sender: mpsc::UnboundedSender<WebSocketOutgoing>,
+    receiver: Arc<Mutex<mpsc::UnboundedReceiver<Result<WebSocketIncoming, String>>>>,
+}
+
+impl UserData for WebSocketHandle {}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -284,6 +309,117 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         })?,
     )?;
     native.set(
+        "websocket_connect",
+        lua.create_function(
+            move |lua, (url, resolve, reject): (String, Function, Function)| {
+                let lua = lua.clone();
+                tokio::task::spawn_local(async move {
+                    match connect_async(&url).await {
+                        Ok((stream, _)) => match lua.create_userdata(websocket_handle(stream)) {
+                            Ok(socket) => settle(resolve.call::<()>(socket)),
+                            Err(error) => settle(reject.call::<()>(error.to_string())),
+                        },
+                        Err(error) => settle(
+                            reject
+                                .call::<()>(format!("websocket.connect({url:?}) failed: {error}")),
+                        ),
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "websocket_receive",
+        lua.create_function(
+            move |lua, (socket, resolve, reject): (AnyUserData, Function, Function)| {
+                let receiver = socket.borrow::<WebSocketHandle>()?.receiver.clone();
+                let lua = lua.clone();
+                tokio::task::spawn_local(async move {
+                    match receiver.lock().await.recv().await {
+                        Some(Ok(message)) => match lua.create_string(&message.data) {
+                            Ok(data) => settle(resolve.call::<()>((message.kind, data))),
+                            Err(error) => settle(reject.call::<()>(error.to_string())),
+                        },
+                        Some(Err(error)) => settle(reject.call::<()>(error)),
+                        None => settle(resolve.call::<()>(())),
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "websocket_send_text",
+        lua.create_function(
+            |_, (socket, message, resolve, reject): (AnyUserData, String, Function, Function)| {
+                match socket
+                    .borrow::<WebSocketHandle>()?
+                    .sender
+                    .send(WebSocketOutgoing::Text(message))
+                {
+                    Ok(()) => settle(resolve.call::<()>(())),
+                    Err(_) => settle(reject.call::<()>("websocket is closed")),
+                }
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "websocket_send_binary",
+        lua.create_function(|_, (socket, message, resolve, reject): (AnyUserData, LuaString, Function, Function)| {
+            let message = message.as_bytes().to_vec();
+            match socket.borrow::<WebSocketHandle>()?.sender.send(WebSocketOutgoing::Binary(message)) {
+                Ok(()) => settle(resolve.call::<()>(())),
+                Err(_) => settle(reject.call::<()>("websocket is closed")),
+            }
+            Ok(())
+        })?,
+    )?;
+    native.set(
+        "websocket_close",
+        lua.create_function(|_, (socket, resolve): (AnyUserData, Function)| {
+            let _ = socket
+                .borrow::<WebSocketHandle>()?
+                .sender
+                .send(WebSocketOutgoing::Close);
+            settle(resolve.call::<()>(()));
+            Ok(())
+        })?,
+    )?;
+    native.set(
+        "websocket_listen",
+        lua.create_function(move |lua, (port, handler): (u16, Function)| {
+            let listener = StdTcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+                LuaError::RuntimeError(format!("websocket server cannot listen on {port}: {error}"))
+            })?;
+            listener.set_nonblocking(true).map_err(LuaError::external)?;
+            let port = listener.local_addr().map_err(LuaError::external)?.port();
+            let listener = TcpListener::from_std(listener).map_err(LuaError::external)?;
+            let lua = lua.clone();
+            tokio::task::spawn_local(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let lua = lua.clone();
+                    let handler = handler.clone();
+                    tokio::task::spawn_local(async move {
+                        match accept_async(stream).await {
+                            Ok(stream) => match lua.create_userdata(websocket_handle(stream)) {
+                                Ok(socket) => settle(handler.call::<()>(socket)),
+                                Err(error) => eprintln!(
+                                    "luauxtx: WebSocket server connection failed: {error}"
+                                ),
+                            },
+                            Err(error) => {
+                                eprintln!("luauxtx: WebSocket server connection failed: {error}")
+                            }
+                        }
+                    });
+                }
+            });
+            Ok(port)
+        })?,
+    )?;
+    native.set(
         "sha256",
         lua.create_function(|_, input: String| {
             Ok(format!("{:x}", Sha256::digest(input.as_bytes())))
@@ -294,6 +430,67 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         lua.create_function(|_, ()| Ok(Uuid::new_v4().to_string()))?,
     )?;
     Ok(native)
+}
+
+fn websocket_handle<S>(stream: WebSocketStream<S>) -> WebSocketHandle
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let (mut writer, mut reader) = stream.split();
+    let (sender, mut outgoing) = mpsc::unbounded_channel();
+    let (incoming_sender, incoming) = mpsc::unbounded_channel();
+    let writer_errors = incoming_sender.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(message) = outgoing.recv().await {
+            let message = match message {
+                WebSocketOutgoing::Text(text) => Message::Text(text.into()),
+                WebSocketOutgoing::Binary(data) => Message::Binary(data.into()),
+                WebSocketOutgoing::Close => Message::Close(None),
+            };
+            let closing = matches!(message, Message::Close(_));
+            if let Err(error) = writer.send(message).await {
+                let _ = writer_errors.send(Err(format!("websocket write failed: {error}")));
+                break;
+            }
+            if closing {
+                break;
+            }
+        }
+    });
+    tokio::task::spawn_local(async move {
+        while let Some(message) = reader.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    let _ = incoming_sender.send(Ok(WebSocketIncoming {
+                        kind: "text",
+                        data: text.as_bytes().to_vec(),
+                    }));
+                }
+                Ok(Message::Binary(data)) => {
+                    let _ = incoming_sender.send(Ok(WebSocketIncoming {
+                        kind: "binary",
+                        data: data.to_vec(),
+                    }));
+                }
+                Ok(Message::Close(_)) => {
+                    let _ = incoming_sender.send(Ok(WebSocketIncoming {
+                        kind: "close",
+                        data: Vec::new(),
+                    }));
+                    break;
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                Err(error) => {
+                    let _ = incoming_sender.send(Err(format!("websocket read failed: {error}")));
+                    break;
+                }
+            }
+        }
+    });
+    WebSocketHandle {
+        sender,
+        receiver: Arc::new(Mutex::new(incoming)),
+    }
 }
 
 async fn serve_http_connection(
@@ -766,6 +963,26 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("Content-Type: application/json\r\n"));
         assert!(response.ends_with("\r\n\r\n{\"id\":\"42\"}"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_client_and_server_exchange_messages() {
+        let local = LocalSet::new();
+        let message: String = local
+            .run_until(async {
+                let lua = Lua::new();
+                let script = PathBuf::from("websocket-test.luau");
+                install_host_apis(&lua, &script, &[])?;
+                lua.load(
+                    "local websocket = require('net/websocket')\nlocal port = websocket.listen(0, function(socket)\n    socket:receive():andThen(function(message) socket:send('echo:' .. message.data) end)\nend)\nlocal client = websocket.connect('ws://127.0.0.1:' .. port):await()\nclient:send('hello'):await()\nreturn client:receive():await().data",
+                )
+                .eval_async()
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(message, "echo:hello");
     }
 
     #[test]

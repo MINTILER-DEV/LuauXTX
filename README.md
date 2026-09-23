@@ -87,6 +87,11 @@ a function (or a `net/http/router` router), and `listen(port)` begins accepting
 connections on `127.0.0.1`. Request bodies are strings; `res:send`,
 `res:json`, `res:status`, and `res:header` build the response.
 
+`require("net/websocket")` supports both client and standalone server sockets.
+`websocket.connect("ws://...")` (and `wss://`) returns a Promise for a socket;
+use `socket:send`, `socket:sendBinary`, `socket:receive`, and `socket:close`.
+`websocket.listen(port, handler)` accepts WebSocket connections on `127.0.0.1`.
+
 `require` caches module return values. Modules must return the value they
 export. Built-in modules are namespaced: `require("system/fs")`,
 `require("system/path")`, `require("net/http")`, `require("net/url")`,
