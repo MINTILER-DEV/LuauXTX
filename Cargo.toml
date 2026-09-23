@@ -5,6 +5,10 @@ edition = "2024"
 description = "A small Luau runtime hosted by Rust"
 license = "MIT"
 
+[workspace]
+members = ["web"]
+resolver = "2"
+
 [lib]
 crate-type = ["rlib"]
 

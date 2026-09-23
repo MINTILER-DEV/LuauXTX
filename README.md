@@ -45,6 +45,22 @@ print(path.join("src", "main.luau"))
 cargo run -- examples/hello.luau world
 ```
 
+## Browser build
+
+Install `wasm-bindgen-cli`, then build the browser crate from the repository
+root. On this MSYS2 setup Luau's C++ build needs the installed WASI sysroot:
+
+```powershell
+cargo install wasm-bindgen-cli
+$env:LUAU_CXXFLAGS = "--target=wasm32-wasip1 --sysroot=D:/Toolchains/msys64/ucrt64/share/wasi-sysroot"
+cargo build -p luauxtx-web --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir web/demo/pkg target/wasm32-unknown-unknown/release/luauxtx_web.wasm
+cd web/demo; python -m http.server
+```
+
+Open the printed local URL. The demo executes Luau through the exported `run`
+function and uses the browser DOM binding to update its button.
+
 The executable accepts a script followed by script arguments. A standalone
 separator is optional:
 

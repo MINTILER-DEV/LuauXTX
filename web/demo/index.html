@@ -1,0 +1,10 @@
+<!doctype html>
+<html><body>
+  <button id="button">click me</button><pre id="output"></pre>
+  <script type="module">
+    import init, { run, set_text } from "./pkg/luauxtx_web.js";
+    await init();
+    document.querySelector("#output").textContent = run("return 'Luau in the browser!' ");
+    document.querySelector("#button").onclick = () => set_text("#button", "clicked");
+  </script>
+</body></html>
