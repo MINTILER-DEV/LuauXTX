@@ -99,9 +99,9 @@ async fn run() -> AppResult<()> {
         .collect();
 
     let local = LocalSet::new();
+    let lua = Lua::new();
     let result = local
         .run_until(async {
-            let lua = Lua::new();
             install_host_apis(&lua, &script, &script_arguments)?;
             execute_entry(&lua, &script, &script_arguments).await
         })
