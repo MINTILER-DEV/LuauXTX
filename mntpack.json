@@ -1,0 +1,8 @@
+{
+  "run": {
+    "windows-x64": "./target/release/sbtext-rs.exe",
+    "linux-x64"  : "./target/release/sbtext-rs",
+    "windows-x86": "./target/release/sbtext-rs.exe",
+    "linux-arm64": "./target/release/sbtext-rs"
+  }
+}
