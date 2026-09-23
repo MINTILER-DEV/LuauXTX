@@ -92,6 +92,11 @@ connections on `127.0.0.1`. Request bodies are strings; `res:send`,
 use `socket:send`, `socket:sendBinary`, `socket:receive`, and `socket:close`.
 `websocket.listen(port, handler)` accepts WebSocket connections on `127.0.0.1`.
 
+`net/tcp` provides `connect(host, port)` and `listen(port, handler)`; connected
+sockets expose Promise-based `send` and `receive`. `net/udp.bind(port)` returns
+a datagram socket with `send(data, host, port)` and `receive`. `net/dns.lookup`
+asynchronously resolves a hostname to an array of IP-address strings.
+
 `require` caches module return values. Modules must return the value they
 export. Built-in modules are namespaced: `require("system/fs")`,
 `require("system/path")`, `require("net/http")`, `require("net/url")`,

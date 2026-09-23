@@ -16,7 +16,7 @@ use mlua::{
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, mpsc},
     task::LocalSet,
 };
@@ -59,6 +59,19 @@ struct WebSocketHandle {
 }
 
 impl UserData for WebSocketHandle {}
+
+struct TcpHandle {
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+    receiver: Arc<Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, String>>>>,
+}
+
+impl UserData for TcpHandle {}
+
+struct UdpHandle {
+    socket: Arc<UdpSocket>,
+}
+
+impl UserData for UdpHandle {}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -330,6 +343,176 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         )?,
     )?;
     native.set(
+        "tcp_connect",
+        lua.create_function(
+            move |lua, (host, port, resolve, reject): (String, u16, Function, Function)| {
+                let lua = lua.clone();
+                tokio::task::spawn_local(async move {
+                    match TcpStream::connect((host.as_str(), port)).await {
+                        Ok(stream) => match lua.create_userdata(tcp_handle(stream)) {
+                            Ok(socket) => settle(resolve.call::<()>(socket)),
+                            Err(error) => settle(reject.call::<()>(error.to_string())),
+                        },
+                        Err(error) => settle(
+                            reject
+                                .call::<()>(format!("tcp.connect({host}:{port}) failed: {error}")),
+                        ),
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "tcp_receive",
+        lua.create_function(
+            move |lua, (socket, resolve, reject): (AnyUserData, Function, Function)| {
+                let receiver = socket.borrow::<TcpHandle>()?.receiver.clone();
+                let lua = lua.clone();
+                tokio::task::spawn_local(async move {
+                    match receiver.lock().await.recv().await {
+                        Some(Ok(bytes)) => match lua.create_string(&bytes) {
+                            Ok(data) => settle(resolve.call::<()>(data)),
+                            Err(error) => settle(reject.call::<()>(error.to_string())),
+                        },
+                        Some(Err(error)) => settle(reject.call::<()>(error)),
+                        None => settle(resolve.call::<()>(())),
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "tcp_send",
+        lua.create_function(
+            |_, (socket, data, resolve, reject): (AnyUserData, LuaString, Function, Function)| {
+                match socket
+                    .borrow::<TcpHandle>()?
+                    .sender
+                    .send(data.as_bytes().to_vec())
+                {
+                    Ok(()) => settle(resolve.call::<()>(())),
+                    Err(_) => settle(reject.call::<()>("TCP socket is closed")),
+                }
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "tcp_listen",
+        lua.create_function(move |lua, (port, handler): (u16, Function)| {
+            let listener = StdTcpListener::bind(("127.0.0.1", port)).map_err(LuaError::external)?;
+            listener.set_nonblocking(true).map_err(LuaError::external)?;
+            let port = listener.local_addr().map_err(LuaError::external)?.port();
+            let listener = TcpListener::from_std(listener).map_err(LuaError::external)?;
+            let lua = lua.clone();
+            tokio::task::spawn_local(async move {
+                while let Ok((stream, address)) = listener.accept().await {
+                    let lua = lua.clone();
+                    let handler = handler.clone();
+                    tokio::task::spawn_local(async move {
+                        match lua.create_userdata(tcp_handle(stream)) {
+                            Ok(socket) => settle(handler.call::<()>((
+                                socket,
+                                address.ip().to_string(),
+                                address.port(),
+                            ))),
+                            Err(error) => {
+                                eprintln!("luauxtx: TCP server connection failed: {error}")
+                            }
+                        }
+                    });
+                }
+            });
+            Ok(port)
+        })?,
+    )?;
+    native.set(
+        "udp_bind",
+        lua.create_function(move |lua, (host, port): (String, u16)| {
+            let socket =
+                std::net::UdpSocket::bind((host.as_str(), port)).map_err(LuaError::external)?;
+            socket.set_nonblocking(true).map_err(LuaError::external)?;
+            let port = socket.local_addr().map_err(LuaError::external)?.port();
+            let socket = UdpSocket::from_std(socket).map_err(LuaError::external)?;
+            let handle = lua.create_userdata(UdpHandle {
+                socket: Arc::new(socket),
+            })?;
+            Ok((handle, port))
+        })?,
+    )?;
+    native.set(
+        "udp_send",
+        lua.create_function(
+            |_,
+             (socket, data, host, port, resolve, reject): (
+                AnyUserData,
+                LuaString,
+                String,
+                u16,
+                Function,
+                Function,
+            )| {
+                let socket = socket.borrow::<UdpHandle>()?.socket.clone();
+                let data = data.as_bytes().to_vec();
+                tokio::task::spawn_local(async move {
+                    match socket.send_to(&data, (host.as_str(), port)).await {
+                        Ok(sent) => settle(resolve.call::<()>(sent)),
+                        Err(error) => {
+                            settle(reject.call::<()>(format!("UDP send failed: {error}")))
+                        }
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "udp_receive",
+        lua.create_function(
+            move |lua, (socket, resolve, reject): (AnyUserData, Function, Function)| {
+                let socket = socket.borrow::<UdpHandle>()?.socket.clone();
+                let lua = lua.clone();
+                tokio::task::spawn_local(async move {
+                    let mut bytes = vec![0; 65_535];
+                    match socket.recv_from(&mut bytes).await {
+                        Ok((length, address)) => match lua.create_string(&bytes[..length]) {
+                            Ok(data) => settle(resolve.call::<()>((
+                                data,
+                                address.ip().to_string(),
+                                address.port(),
+                            ))),
+                            Err(error) => settle(reject.call::<()>(error.to_string())),
+                        },
+                        Err(error) => {
+                            settle(reject.call::<()>(format!("UDP receive failed: {error}")))
+                        }
+                    }
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    native.set(
+        "dns_lookup",
+        lua.create_function(|_, (host, resolve, reject): (String, Function, Function)| {
+            tokio::task::spawn_local(async move {
+                match tokio::net::lookup_host((host.as_str(), 0)).await {
+                    Ok(addresses) => {
+                        let addresses: Vec<String> =
+                            addresses.map(|address| address.ip().to_string()).collect();
+                        settle(resolve.call::<()>(addresses));
+                    }
+                    Err(error) => settle(
+                        reject.call::<()>(format!("DNS lookup for {host:?} failed: {error}")),
+                    ),
+                }
+            });
+            Ok(())
+        })?,
+    )?;
+    native.set(
         "websocket_receive",
         lua.create_function(
             move |lua, (socket, resolve, reject): (AnyUserData, Function, Function)| {
@@ -430,6 +613,40 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         lua.create_function(|_, ()| Ok(Uuid::new_v4().to_string()))?,
     )?;
     Ok(native)
+}
+
+fn tcp_handle(stream: TcpStream) -> TcpHandle {
+    let (mut reader, mut writer) = stream.into_split();
+    let (sender, mut outgoing) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (incoming_sender, incoming) = mpsc::unbounded_channel();
+    let write_errors = incoming_sender.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(bytes) = outgoing.recv().await {
+            if let Err(error) = writer.write_all(&bytes).await {
+                let _ = write_errors.send(Err(format!("TCP write failed: {error}")));
+                break;
+            }
+        }
+    });
+    tokio::task::spawn_local(async move {
+        let mut bytes = vec![0; 8192];
+        loop {
+            match reader.read(&mut bytes).await {
+                Ok(0) => break,
+                Ok(length) => {
+                    let _ = incoming_sender.send(Ok(bytes[..length].to_vec()));
+                }
+                Err(error) => {
+                    let _ = incoming_sender.send(Err(format!("TCP read failed: {error}")));
+                    break;
+                }
+            }
+        }
+    });
+    TcpHandle {
+        sender,
+        receiver: Arc::new(Mutex::new(incoming)),
+    }
 }
 
 fn websocket_handle<S>(stream: WebSocketStream<S>) -> WebSocketHandle
@@ -983,6 +1200,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(message, "echo:hello");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_udp_and_dns_apis_work() {
+        let local = LocalSet::new();
+        let result: String = local
+            .run_until(async {
+                let lua = Lua::new();
+                let script = PathBuf::from("network-api-test.luau");
+                install_host_apis(&lua, &script, &[])?;
+                lua.load(
+                    "local tcp = require('net/tcp')\nlocal udp = require('net/udp')\nlocal dns = require('net/dns')\nlocal tcp_port = tcp.listen(0, function(socket) socket:receive():andThen(function(data) socket:send('echo:' .. data) end) end)\nlocal client = tcp.connect('127.0.0.1', tcp_port):await()\nclient:send('hello'):await()\nlocal tcp_result = client:receive():await()\nlocal receiver = udp.bind(0)\nlocal sender = udp.bind(0)\nsender:send('ping', '127.0.0.1', receiver.port):await()\nlocal udp_result = receiver:receive():await().data\nlocal addresses = dns.lookup('localhost'):await()\nassert(#addresses > 0)\nreturn tcp_result .. ':' .. udp_result",
+                )
+                .eval_async()
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, "echo:hello:ping");
     }
 
     #[test]
