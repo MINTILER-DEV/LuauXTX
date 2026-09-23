@@ -2,6 +2,7 @@ use std::{
     env,
     error::Error,
     fs,
+    net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -10,7 +11,11 @@ use mlua::{
     Error as LuaError, Function, Lua, MultiValue, Result as LuaResult, Table, Thread, Value,
 };
 use sha2::{Digest, Sha256};
-use tokio::task::LocalSet;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::LocalSet,
+};
 use uuid::Uuid;
 
 mod standard_library {
@@ -249,6 +254,36 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         })?,
     )?;
     native.set(
+        "http_listen",
+        lua.create_function(|_, (port, handler): (u16, Function)| {
+            let listener = StdTcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+                LuaError::RuntimeError(format!("http server cannot listen on {port}: {error}"))
+            })?;
+            listener.set_nonblocking(true).map_err(LuaError::external)?;
+            let port = listener.local_addr().map_err(LuaError::external)?.port();
+            let listener = TcpListener::from_std(listener).map_err(LuaError::external)?;
+            tokio::task::spawn_local(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((socket, _)) => {
+                            let handler = handler.clone();
+                            tokio::task::spawn_local(async move {
+                                if let Err(error) = serve_http_connection(socket, handler).await {
+                                    eprintln!("luauxtx: HTTP server request failed: {error}");
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            eprintln!("luauxtx: HTTP server accept failed: {error}");
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok(port)
+        })?,
+    )?;
+    native.set(
         "sha256",
         lua.create_function(|_, input: String| {
             Ok(format!("{:x}", Sha256::digest(input.as_bytes())))
@@ -259,6 +294,126 @@ fn create_native_api(lua: &Lua) -> LuaResult<Table> {
         lua.create_function(|_, ()| Ok(Uuid::new_v4().to_string()))?,
     )?;
     Ok(native)
+}
+
+async fn serve_http_connection(
+    mut socket: tokio::net::TcpStream,
+    handler: Function,
+) -> LuaResult<()> {
+    let (method, target, body) = read_http_request(&mut socket).await?;
+    let (status, headers, body): (i64, Table, String) =
+        handler.call_async((method, target, body)).await?;
+    let status = u16::try_from(status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+        .unwrap_or(500);
+    let mut response_headers = String::new();
+    for pair in headers.pairs::<String, String>() {
+        let (name, value) = pair?;
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(LuaError::RuntimeError(
+                "HTTP response headers cannot contain newlines".to_owned(),
+            ));
+        }
+        response_headers.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if !response_headers
+        .to_ascii_lowercase()
+        .contains("content-type:")
+    {
+        response_headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    }
+    response_headers.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    ));
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\n{response_headers}\r\n",
+        reason_phrase(status)
+    );
+    socket
+        .write_all(response.as_bytes())
+        .await
+        .map_err(LuaError::external)?;
+    socket
+        .write_all(body.as_bytes())
+        .await
+        .map_err(LuaError::external)?;
+    Ok(())
+}
+
+async fn read_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> LuaResult<(String, String, String)> {
+    const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+    let mut bytes = Vec::with_capacity(4096);
+    let header_end = loop {
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if bytes.len() >= MAX_REQUEST_SIZE {
+            return Err(LuaError::RuntimeError(
+                "HTTP request is too large".to_owned(),
+            ));
+        }
+        let mut chunk = [0; 4096];
+        let read = socket.read(&mut chunk).await.map_err(LuaError::external)?;
+        if read == 0 {
+            return Err(LuaError::RuntimeError(
+                "HTTP client closed request early".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    };
+    let header_text = std::str::from_utf8(&bytes[..header_end]).map_err(LuaError::external)?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default().to_owned();
+    let target = request_parts.next().unwrap_or_default().to_owned();
+    if method.is_empty() || target.is_empty() || request_parts.next().is_none() {
+        return Err(LuaError::RuntimeError(
+            "malformed HTTP request line".to_owned(),
+        ));
+    }
+    let content_length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose()
+        .map_err(LuaError::external)?
+        .unwrap_or(0);
+    if content_length > MAX_REQUEST_SIZE || header_end + content_length > MAX_REQUEST_SIZE {
+        return Err(LuaError::RuntimeError(
+            "HTTP request is too large".to_owned(),
+        ));
+    }
+    while bytes.len() < header_end + content_length {
+        let mut chunk = [0; 4096];
+        let read = socket.read(&mut chunk).await.map_err(LuaError::external)?;
+        if read == 0 {
+            return Err(LuaError::RuntimeError(
+                "HTTP client closed request body early".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let body = String::from_utf8(bytes[header_end..header_end + content_length].to_vec())
+        .map_err(LuaError::external)?;
+    Ok((method, target, body))
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
 }
 
 fn schedule_thread(
@@ -458,7 +613,7 @@ mod tests {
     use super::*;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
     };
 
     #[test]
@@ -575,6 +730,42 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(body, "hello");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_server_routes_requests_and_serializes_json() {
+        let local = LocalSet::new();
+        let response = local
+            .run_until(async {
+                let lua = Lua::new();
+                let script = PathBuf::from("http-server-test.luau");
+                install_host_apis(&lua, &script, &[])?;
+                let port: u16 = lua
+                    .load(
+                        "local http = require('net/http/server')\nlocal Router = require('net/http/router')\nlocal app = Router.new()\napp:get('/users/:id', function(req, res) res:json({ id = req.params.id }) end)\nreturn http.createServer(app):listen(0)",
+                    )
+                    .eval_async()
+                    .await?;
+                let mut socket = TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .map_err(LuaError::external)?;
+                socket
+                    .write_all(b"GET /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .map_err(LuaError::external)?;
+                let mut response = String::new();
+                socket
+                    .read_to_string(&mut response)
+                    .await
+                    .map_err(LuaError::external)?;
+                Ok::<_, LuaError>(response)
+            })
+            .await
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.ends_with("\r\n\r\n{\"id\":\"42\"}"));
     }
 
     #[test]

@@ -13,7 +13,8 @@ primitives to those modules only; user scripts receive the public `Promise`,
 - [`lib/async/promise.luau`](lib/async/promise.luau) implements promise state and chaining.
 - [`lib/async/task.luau`](lib/async/task.luau) wraps coroutine scheduling and timers.
 - [`lib/system/fs.luau`](lib/system/fs.luau) turns filesystem completions into promises.
-- [`lib/net/http.luau`](lib/net/http.luau) shapes HTTP responses as Luau values.
+- [`lib/net/http/client.luau`](lib/net/http/client.luau) provides HTTP client requests.
+- [`lib/net/http/server.luau`](lib/net/http/server.luau) provides a small HTTP server.
 
 To add a built-in module, create a `.luau` file in `lib/` and rebuild. Module
 names follow their path, so `lib/system/path.luau` is loaded with
@@ -80,6 +81,11 @@ print(response.status, response.body)
 `task.wait`, `task.spawn`, `task.defer`, and `task.delay` use the runtime event
 loop. `Promise` supports `resolve`, `reject`, `all`, `andThen`, `catch`, and
 `await`. HTTP currently provides an asynchronous `http.fetch(url)` GET client.
+
+For a small HTTP server, use `require("net/http/server")`. `createServer` takes
+a function (or a `net/http/router` router), and `listen(port)` begins accepting
+connections on `127.0.0.1`. Request bodies are strings; `res:send`,
+`res:json`, `res:status`, and `res:header` build the response.
 
 `require` caches module return values. Modules must return the value they
 export. Built-in modules are namespaced: `require("system/fs")`,
